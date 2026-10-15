@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
+import { SafeAreaTopScrim, fileToBase64 } from "@hatch/space-sdk/client";
+import { PdfViewer } from "@hatch/space-sdk/pdf";
+import { getDocument, type PDFDocumentProxy } from "pdfjs-dist";
 import { api, type ApiResponse } from "./api";
 import { parseProjectWorkbook, type WorkbookImportPreview } from "./excel";
 
@@ -51,6 +53,7 @@ const moduleDefs: ModuleDef[] = [
     { key: "inScope", label: "In Scope", type: "textarea" }, { key: "outOfScope", label: "Out of Scope", type: "textarea" },
     { key: "deliverables", label: "Deliverables", type: "textarea" }, { key: "exclusions", label: "Exclusions", type: "textarea" },
   ]},
+  { key: "drawing-proposal", label: "Drawing → Proposal", phase: "PLAN", intro: "Scan drawings into an estimator-reviewed scope and a formal 20% markup proposal." },
   { key: "wbs", label: "WBS Builder", phase: "PLAN", intro: "Break deliverables into estimable work packages.", rowLabel: "WBS Item", rowFields: [
     { key: "wbsId", label: "WBS ID" }, { key: "level", label: "Level", type: "number" }, { key: "deliverable", label: "Deliverable / Work Package" },
     { key: "requirementIds", label: "Linked Requirement IDs", placeholder: "REQ-01, REQ-02" },
@@ -60,7 +63,7 @@ const moduleDefs: ModuleDef[] = [
   ]},
   { key: "pert", label: "PERT Estimator", phase: "PLAN", intro: "Use three-point estimates to expose uncertainty.", rowLabel: "PERT Estimate", rowFields: [
     { key: "activityId", label: "Activity ID" }, { key: "activityName", label: "Activity Name" }, { key: "predecessors", label: "Predecessor(s)" },
-    { key: "optimistic", label: "Optimistic (O)", type: "number" }, { key: "mostLikely", label: "Most Likely (M)", type: "number" },
+    { key: "optimistic", label: "Optimistic (O)", type: "number" }, { key: "most_likely", label: "Most Likely (M)", type: "number" },
     { key: "pessimistic", label: "Pessimistic (P)", type: "number" }, { key: "owner", label: "Owner" }, { key: "notes", label: "Notes", type: "textarea" },
   ]},
   { key: "timeline", label: "Project Timeline", phase: "PLAN", intro: "Build the dependency-aware baseline.", rowLabel: "Timeline Item", rowFields: [
@@ -167,6 +170,7 @@ function RowEditor({ row, projectId, module, raciRoles, allRows }: { row: DataRo
   const [form, setForm] = useState<Record<string, string>>(() => {
     const initial = parseJson(row.dataJson);
     if (module.key === "ac-log" && !initial.status) initial.status = "Open";
+    if (module.key === "pert" && !("most_likely" in initial) && initial.mostLikely !== undefined) initial.most_likely = initial.mostLikely;
     return initial;
   });
   const [spawnOwner, setSpawnOwner] = useState(() => parseJson(row.dataJson).owner ?? "");
@@ -181,7 +185,7 @@ function RowEditor({ row, projectId, module, raciRoles, allRows }: { row: DataRo
   const spawnKickoff = useMutation({ mutationFn: () => api.spawnKickoffTask({ projectId, rowId: row.id, owner: spawnOwner, dueDate: spawnDueDate }), onSuccess: async (r) => { setMessage(r.message); if (r.ok) setSpawnOpen(false); await qc.invalidateQueries(); } });
   const linkedTask = module.key === "kickoff" ? allRows.find((candidate) => candidate.moduleKey === "task-tracker" && candidate.sourceRowId === row.id) : undefined;
   const linkedTaskData = linkedTask ? parseJson(linkedTask.dataJson) : undefined;
-  const o = Number(form.optimistic || 0), m = Number(form.mostLikely || 0), p = Number(form.pessimistic || 0);
+  const o = Number(form.optimistic || 0), m = Number(form.most_likely || form.mostLikely || 0), p = Number(form.pessimistic || 0);
   const expected = (o + 4 * m + p) / 6, sd = (p - o) / 6;
   const planned = ["mon","tue","wed","thu","fri","sat","sun"].reduce((sum, key) => sum + Number(form[key] || 0), 0);
   const hasBudget = form.budgetedCost !== "" && form.budgetedCost !== undefined;
@@ -281,6 +285,243 @@ function ExcelTools({ selected, onImported }: { selected: Project; onImported: (
       <div className="import-confirm"><p>A new project will be created. Existing projects will not be changed.</p><button type="button" className="primary" disabled={!preview.canImport || importWorkbook.isPending} onClick={() => { setError(""); importWorkbook.mutate(preview); }}>{importWorkbook.isPending ? "Creating project…" : "Confirm and create project"}</button>{!preview.canImport && <span>Add Project Name and Project ID in the Business Case sheet, then upload the workbook again.</span>}{error && <span className="error">{error}</span>}</div>
     </section></div>}
   </section>;
+}
+
+type Confidence = "high" | "medium" | "low";
+type DrawingAnalysis = {
+  documentAssessment?: "construction_drawing" | "not_construction_drawing" | "uncertain"; documentAssessmentReason?: string;
+  titleBlock: { projectName: string; drawingTitle: string; drawingNumber: string; date: string; revision: string; designer: string };
+  scopeSummary: string; rooms: string[]; dimensions: Array<{ label: string; value: string; location: string; confidence: Confidence; sourceReference: string }>;
+  notes: string[]; items: Array<{ description: string; quantity: number | null; unit: string; location: string; confidence: Confidence; uncertainty: string; sourceReference: string }>;
+  assumptions: string[]; exclusions: string[]; reviewFlags: string[];
+};
+type ProposalLine = { description: string; quantity: number; unit: string; baseUnitCost: number; confidence: Confidence; uncertainty: string; sourceReference: string };
+type ProposalDraft = {
+  proposalNumber: string; preparedFor: string; preparedBy: string; proposalDate: string; validThrough: string; projectName: string; projectLocation: string;
+  scopeNarrative: string; lineItems: ProposalLine[]; assumptions: string[]; exclusions: string[]; terms: string[]; signatureClientLabel: string; signatureContractorLabel: string; notes: string;
+};
+type DrawingRecord = ApiResponse<typeof api, "listDrawingProposals">["proposals"][number];
+
+const emptyAnalysis: DrawingAnalysis = { documentAssessment: "uncertain", documentAssessmentReason: "", titleBlock: { projectName: "", drawingTitle: "", drawingNumber: "", date: "", revision: "", designer: "" }, scopeSummary: "", rooms: [], dimensions: [], notes: [], items: [], assumptions: [], exclusions: [], reviewFlags: [] };
+const emptyProposal: ProposalDraft = { proposalNumber: "", preparedFor: "", preparedBy: "", proposalDate: "", validThrough: "", projectName: "", projectLocation: "", scopeNarrative: "", lineItems: [], assumptions: [], exclusions: [], terms: [], signatureClientLabel: "Client authorization", signatureContractorLabel: "Contractor acceptance", notes: "" };
+const MAX_DRAWING_FILE_BYTES = 100 * 1024 * 1024;
+
+function formatFileSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+async function normalizeDrawingUpload(file: File): Promise<{ file: File; mimeType: "application/pdf" | "image/jpeg" | "image/png" }> {
+  if (file.type === "application/pdf") return { file, mimeType: "application/pdf" };
+  if (file.type === "image/jpeg") return { file, mimeType: "image/jpeg" };
+  if (file.type === "image/png") return { file, mimeType: "image/png" };
+  if (!file.type.startsWith("image/")) throw new Error("Choose a PDF or image file.");
+  const bitmap = await createImageBitmap(file);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width; canvas.height = bitmap.height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("This image could not be prepared.");
+    context.drawImage(bitmap, 0, 0);
+    const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("This image could not be converted.")), "image/png"));
+    return { file: new File([blob], `${file.name.replace(/\.[^.]+$/, "")}.png`, { type: "image/png" }), mimeType: "image/png" };
+  } finally { bitmap.close(); }
+}
+
+type PdfPageImage = { dataBase64: string; mimeType: "image/jpeg"; filename: string; caption: string };
+
+async function openDrawingPdf(file: File): Promise<PDFDocumentProxy> {
+  try {
+    const loadingTask = getDocument({
+      data: new Uint8Array(await file.arrayBuffer()),
+      cMapPacked: true,
+      cMapUrl: "./assets/pdfjs/5.4.624/cmaps/",
+      enableXfa: false,
+      isEvalSupported: false,
+      standardFontDataUrl: "./assets/pdfjs/5.4.624/standard_fonts/",
+      useWorkerFetch: true,
+      wasmUrl: "./assets/pdfjs/5.4.624/wasm/",
+    });
+    return await loadingTask.promise;
+  } catch (reason) {
+    const name = reason instanceof Error ? reason.name : "";
+    if (name === "PasswordException") throw new Error("This PDF is password-protected. Remove the password in the source application, then upload it again.");
+    throw new Error("This file could not be opened as a valid PDF. Export a new or flattened PDF from the source application, then try again.");
+  }
+}
+
+async function renderPdfBatch(pdf: PDFDocumentProxy, firstPage: number, lastPage: number): Promise<PdfPageImage[]> {
+  const images: PdfPageImage[] = [];
+  for (let pageNumber = firstPage; pageNumber <= lastPage; pageNumber += 1) {
+    const page = await pdf.getPage(pageNumber);
+    try {
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = Math.min(110 / 72, 2400 / Math.max(baseViewport.width, baseViewport.height));
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.ceil(viewport.width));
+      canvas.height = Math.max(1, Math.ceil(viewport.height));
+      const context = canvas.getContext("2d", { alpha: false });
+      if (!context) throw new Error(`Page ${pageNumber} could not create a drawing surface.`);
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvas, canvasContext: context, viewport }).promise;
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error(`Page ${pageNumber} could not be converted to an image.`)), "image/jpeg", 0.76));
+      const encoded = await fileToBase64(new File([blob], `page-${pageNumber}.jpg`, { type: "image/jpeg" }));
+      images.push({ dataBase64: encoded.dataBase64, mimeType: "image/jpeg", filename: `page-${pageNumber}.jpg`, caption: `Drawing page ${pageNumber} of ${pdf.numPages}` });
+      canvas.width = 1;
+      canvas.height = 1;
+    } finally {
+      page.cleanup();
+    }
+  }
+  return images;
+}
+
+function ProposalEditor({ record, projectId }: { record: DrawingRecord; projectId: number }) {
+  const qc = useQueryClient();
+  const analysis = useMemo(() => {
+    try {
+      const parsed = JSON.parse(record.analysisJson) as Partial<DrawingAnalysis>;
+      return { ...emptyAnalysis, ...parsed, titleBlock: { ...emptyAnalysis.titleBlock, ...(parsed.titleBlock ?? {}) } };
+    } catch { return emptyAnalysis; }
+  }, [record.analysisJson]);
+  const appearsToBeNonDrawing = analysis.documentAssessment === "not_construction_drawing" || (
+    !analysis.items.length && !analysis.dimensions.length && analysis.reviewFlags.some((flag) => /does not (show|contain).*construction drawing|software UI screenshot|no construction drawing/i.test(flag))
+  );
+  const [draft, setDraft] = useState<ProposalDraft>(() => {
+    try { return { ...emptyProposal, ...(JSON.parse(record.proposalJson) as Partial<ProposalDraft>) }; }
+    catch { return emptyProposal; }
+  });
+  const [message, setMessage] = useState("");
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const save = useMutation({ mutationFn: (reviewed: boolean) => api.saveDrawingProposal({ id: record.id, projectId, proposalJson: JSON.stringify(draft), markReviewed: reviewed }), onSuccess: async (result) => { setMessage(result.message); if (result.ok) await qc.invalidateQueries({ queryKey: ["drawing-proposals", projectId] }); } });
+  const remove = useMutation({ mutationFn: () => api.deleteDrawingProposal({ id: record.id, projectId }), onSuccess: async (result) => { setMessage(result.message); if (result.ok) await qc.invalidateQueries({ queryKey: ["drawing-proposals", projectId] }); } });
+  if (record.status === "processing") return <section className="honest-empty interrupted-scan" aria-label={`Incomplete scan ${record.fileName}`}><h3>PDF scan was interrupted</h3><p>{record.fileName} is saved, but its page analysis did not finish. Remove this incomplete record, then select the PDF again to restart the scan.</p><button type="button" className="danger" disabled={remove.isPending} onClick={() => remove.mutate()}>{remove.isPending ? "Removing…" : "Remove incomplete scan"}</button>{message && <p className={remove.data?.ok ? "success" : "error"}>{message}</p>}</section>;
+  const money = (value: number) => new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(value);
+  const baseSubtotal = draft.lineItems.reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.baseUnitCost || 0), 0);
+  const markup = baseSubtotal * 0.2;
+  const total = baseSubtotal + markup;
+  const updateLine = (index: number, patch: Partial<ProposalLine>) => setDraft((current) => ({ ...current, lineItems: current.lineItems.map((line, itemIndex) => itemIndex === index ? { ...line, ...patch } : line) }));
+  const updateList = (key: "assumptions" | "exclusions" | "terms", value: string) => setDraft((current) => ({ ...current, [key]: value.split("\n").map((item) => item.trim()).filter(Boolean) }));
+  return <div className="drawing-editor">
+    <section className="drawing-source" aria-labelledby={`drawing-source-${record.id}`}>
+      <div className="drawing-source-head"><div><p>Source drawing</p><h3 id={`drawing-source-${record.id}`}>{record.fileName}</h3><span>{record.mimeType === "application/pdf" ? "PDF" : "Image"} · scanned {new Date(record.createdAt).toLocaleString()}</span></div><span className={`proposal-status ${record.status}`}>{record.status}</span></div>
+      {record.mimeType === "application/pdf" ? <PdfViewer src={record.fileUrl} ariaLabel={`Source drawing ${record.fileName}`} className="drawing-pdf" /> : <img className="drawing-image" src={record.fileUrl} alt={`Uploaded construction drawing ${record.fileName}`} />}
+    </section>
+
+    <section className="extraction-review" aria-labelledby={`extraction-${record.id}`}>
+      <div className="proposal-section-heading"><div><p>AI extraction</p><h3 id={`extraction-${record.id}`}>Estimator review</h3></div><span>{analysis.reviewFlags.length} flags</span></div>
+      {appearsToBeNonDrawing && <div className="wrong-file-warning" role="alert"><strong>This record does not contain a drawing</strong><span>The saved source appears to be a screenshot or another non-drawing PDF. It is not a scan of the intended plan set. Remove this record, then choose the actual drawing file and confirm its name before scanning.</span></div>}
+      <div className="estimate-warning"><strong>Estimating aid only</strong><span>All quantities are estimates, not engineering-grade takeoffs. Verify dimensions, scope, and quantities against the full drawing set and field conditions.</span></div>
+      {analysis.reviewFlags.length > 0 && <div className="review-flags"><strong>Review before pricing</strong><ul>{analysis.reviewFlags.map((flag, index) => <li key={`${flag}-${index}`}>{flag}</li>)}</ul></div>}
+      <div className="title-block-grid">{Object.entries(analysis.titleBlock).map(([key, value]) => <div key={key}><span>{key.replace(/([A-Z])/g, " $1")}</span><b>{value || "Not found"}</b></div>)}</div>
+      <div className="extraction-columns"><div><h4>Scope</h4><p>{analysis.scopeSummary || "No supported scope narrative was extracted."}</p><h4>Rooms / areas</h4><p>{analysis.rooms.length ? analysis.rooms.join(" · ") : "No rooms or areas detected."}</p></div><div><h4>Drawing notes</h4>{analysis.notes.length ? <ul>{analysis.notes.map((note, index) => <li key={`${note}-${index}`}>{note}</li>)}</ul> : <p>No readable notes detected.</p>}</div></div>
+      <details className="extraction-details"><summary>Dimensions extracted <span>{analysis.dimensions.length}</span></summary><div className="dimension-list">{analysis.dimensions.length ? analysis.dimensions.map((dimension, index) => <div key={`${dimension.label}-${index}`}><b>{dimension.label}: {dimension.value}</b><span>{dimension.location || "Location not shown"} · {dimension.sourceReference || "No source reference"}</span><em className={`confidence ${dimension.confidence}`}>{dimension.confidence}</em></div>) : <p>No supported dimensions were extracted.</p>}</div></details>
+    </section>
+
+    <section className="proposal-workbench" aria-labelledby={`proposal-${record.id}`}>
+      <div className="proposal-section-heading"><div><p>Formal proposal</p><h3 id={`proposal-${record.id}`}>Review, price, and approve</h3></div><span>20% markup locked</span></div>
+      <div className="proposal-meta-grid">
+        <FieldControl field={{ key: "proposalNumber", label: "Proposal Number" }} value={draft.proposalNumber} onChange={(value) => setDraft((current) => ({ ...current, proposalNumber: value }))} />
+        <FieldControl field={{ key: "proposalDate", label: "Proposal Date", type: "date" }} value={draft.proposalDate} onChange={(value) => setDraft((current) => ({ ...current, proposalDate: value }))} />
+        <FieldControl field={{ key: "validThrough", label: "Valid Through" }} value={draft.validThrough} onChange={(value) => setDraft((current) => ({ ...current, validThrough: value }))} />
+        <FieldControl field={{ key: "preparedFor", label: "Prepared For" }} value={draft.preparedFor} onChange={(value) => setDraft((current) => ({ ...current, preparedFor: value }))} />
+        <FieldControl field={{ key: "preparedBy", label: "Prepared By" }} value={draft.preparedBy} onChange={(value) => setDraft((current) => ({ ...current, preparedBy: value }))} />
+        <FieldControl field={{ key: "projectLocation", label: "Project Location" }} value={draft.projectLocation} onChange={(value) => setDraft((current) => ({ ...current, projectLocation: value }))} />
+      </div>
+      <FieldControl field={{ key: "scopeNarrative", label: "Scope Narrative", type: "textarea" }} value={draft.scopeNarrative} onChange={(value) => setDraft((current) => ({ ...current, scopeNarrative: value }))} />
+      <div className="line-items-heading"><div><h4>Line-item breakdown <span className="line-item-count">{draft.lineItems.length} {draft.lineItems.length === 1 ? "item" : "items"}</span></h4><span>{draft.lineItems.length ? "Extracted quantities are ready for estimator review. Enter subcontractor or base unit costs when pricing begins." : "No supported quantities were found in this proposal draft. Add a line manually after reviewing the drawing."}</span></div><button type="button" className="secondary" onClick={() => setDraft((current) => ({ ...current, lineItems: [...current.lineItems, { description: "", quantity: 0, unit: "", baseUnitCost: 0, confidence: "low", uncertainty: "Manually added; verify scope and quantity.", sourceReference: "" }] }))}>Add line item</button></div>
+      <div className="proposal-lines">{draft.lineItems.map((line, index) => { const base = Number(line.quantity || 0) * Number(line.baseUnitCost || 0); return <article className="proposal-line" key={`${index}-${line.sourceReference}`}>
+        <div className="line-number">{String(index + 1).padStart(2, "0")}</div><FieldControl field={{ key: `description-${index}`, label: "Description" }} value={line.description} onChange={(value) => updateLine(index, { description: value })} />
+        <FieldControl field={{ key: `quantity-${index}`, label: "Est. Quantity", type: "number" }} value={String(line.quantity)} onChange={(value) => updateLine(index, { quantity: Math.max(0, Number(value || 0)) })} />
+        <FieldControl field={{ key: `unit-${index}`, label: "Unit" }} value={line.unit} onChange={(value) => updateLine(index, { unit: value })} />
+        <FieldControl field={{ key: `base-cost-${index}`, label: "Base Unit Cost", type: "number" }} value={String(line.baseUnitCost)} onChange={(value) => updateLine(index, { baseUnitCost: Math.max(0, Number(value || 0)) })} />
+        <div className="line-total"><span>Proposal total</span><b>{money(base * 1.2)}</b><small>{money(base)} base + {money(base * .2)} markup</small></div>
+        <div className="line-evidence"><span className={`confidence ${line.confidence}`}>{line.confidence} confidence</span><span>{line.uncertainty || "Uncertainty not documented"}</span><small>{line.sourceReference || "No drawing reference"}</small></div>
+        <button type="button" className="line-remove" onClick={() => setDraft((current) => ({ ...current, lineItems: current.lineItems.filter((_item, itemIndex) => itemIndex !== index) }))}>Remove line</button>
+      </article>; })}{!draft.lineItems.length && <div className="honest-empty compact"><h3>No line items extracted</h3><p>Add line items manually after reviewing the drawing.</p></div>}</div>
+      <div className="proposal-totals"><div><span>Base cost</span><b>{money(baseSubtotal)}</b></div><div><span>Markup (20%)</span><b>{money(markup)}</b></div><div className="grand"><span>Proposal total</span><b>{money(total)}</b></div></div>
+      <div className="proposal-list-fields"><FieldControl field={{ key: "assumptions", label: "Assumptions (one per line)", type: "textarea" }} value={draft.assumptions.join("\n")} onChange={(value) => updateList("assumptions", value)} /><FieldControl field={{ key: "exclusions", label: "Exclusions (one per line)", type: "textarea" }} value={draft.exclusions.join("\n")} onChange={(value) => updateList("exclusions", value)} /><FieldControl field={{ key: "terms", label: "Terms (one per line)", type: "textarea" }} value={draft.terms.join("\n")} onChange={(value) => updateList("terms", value)} /></div>
+      <div className="action-row"><button type="button" className="secondary" disabled={save.isPending} onClick={() => { setMessage(""); save.mutate(false); }}>{save.isPending ? "Saving…" : "Save draft"}</button><button type="button" className="primary" disabled={save.isPending || appearsToBeNonDrawing} title={appearsToBeNonDrawing ? "Choose and scan the actual drawing set before review." : undefined} onClick={() => { setMessage(""); save.mutate(true); }}>{save.isPending ? "Checking…" : appearsToBeNonDrawing ? "Drawing required" : "Mark reviewed"}</button><button type="button" className="danger" onClick={() => setRemoveOpen(!removeOpen)}>{removeOpen ? "Keep proposal" : "Remove record"}</button>{message && <p className={save.data?.ok || remove.data?.ok ? "success" : "error"} aria-live="polite">{message}</p>}</div>
+      {removeOpen && <div className="remove-confirm"><span>This removes the drawing and its proposal record.</span><button type="button" className="danger" disabled={remove.isPending} onClick={() => remove.mutate()}>{remove.isPending ? "Removing…" : "Confirm removal"}</button></div>}
+    </section>
+
+    <section className="formal-proposal" aria-label="Formal proposal preview">
+      <div className="proposal-cover"><p>Construction proposal</p><h2>{draft.projectName || "Untitled project"}</h2><span>{draft.projectLocation}</span><div><b>{draft.proposalNumber}</b><span>Prepared {draft.proposalDate || "date pending"}</span><span>For {draft.preparedFor || "client pending"}</span><span>By {draft.preparedBy || "contractor pending"}</span></div></div>
+      <div className="proposal-page"><section><p className="document-kicker">Scope of work</p><h3>Project narrative</h3><p>{draft.scopeNarrative || "Scope narrative pending estimator review."}</p></section><section><p className="document-kicker">Pricing</p><h3>Line-item proposal</h3><div className="formal-lines">{draft.lineItems.map((line, index) => <div key={`${line.description}-${index}`}><span>{index + 1}</span><b>{line.description || "Untitled line item"}<small>{line.quantity} {line.unit} · estimate · {line.confidence} confidence</small></b><strong>{money(line.quantity * line.baseUnitCost * 1.2)}</strong></div>)}</div><div className="formal-total"><span>Base {money(baseSubtotal)} + 20% markup {money(markup)}</span><b>{money(total)}</b></div></section><div className="formal-columns"><section><p className="document-kicker">Assumptions</p><ul>{draft.assumptions.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section><section><p className="document-kicker">Exclusions</p><ul>{draft.exclusions.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section></div><section><p className="document-kicker">Terms</p><ul>{draft.terms.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section><div className="estimate-disclaimer">Quantities shown are estimates with documented uncertainty, not engineering-grade takeoffs. Field verification and qualified trade review are required before procurement or construction.</div><div className="signature-grid"><div><span>{draft.signatureClientLabel}</span><i /><small>Signature / date</small></div><div><span>{draft.signatureContractorLabel}</span><i /><small>Signature / date</small></div></div></div>
+    </section>
+  </div>;
+}
+
+function DrawingProposalCenter({ projectId }: { projectId: number }) {
+  const qc = useQueryClient();
+  const input = useRef<HTMLInputElement>(null);
+  const [selectedId, setSelectedId] = useState(0);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [scanProgress, setScanProgress] = useState("");
+  const proposals = useQuery({ queryKey: ["drawing-proposals", projectId], queryFn: () => api.listDrawingProposals({ projectId }) });
+  const scan = useMutation({
+    mutationFn: async (source: File) => {
+      if (source.size > MAX_DRAWING_FILE_BYTES) throw new Error("Choose a drawing no larger than 100 MB.");
+      const normalized = await normalizeDrawingUpload(source);
+      if (normalized.file.size > MAX_DRAWING_FILE_BYTES) throw new Error("The prepared drawing is larger than 100 MB. Export it as a compressed PDF or JPEG and try again.");
+      if (normalized.mimeType !== "application/pdf") {
+        setScanProgress("Analyzing drawing image…");
+        const encoded = await fileToBase64(normalized.file);
+        return api.scanDrawing({ projectId, fileName: normalized.file.name, mimeType: normalized.mimeType, dataBase64: encoded.dataBase64 });
+      }
+
+      setScanProgress("Opening PDF on this device…");
+      const pdf = await openDrawingPdf(normalized.file);
+      let scanId = 0;
+      try {
+        if (pdf.numPages > 100) throw new Error(`This PDF has ${pdf.numPages} pages. The drawing scanner can analyze up to 100 pages in one set. Split it into smaller plan volumes and upload each volume separately.`);
+        setScanProgress(`PDF opened: ${pdf.numPages} pages. Saving the source file…`);
+        const encoded = await fileToBase64(normalized.file);
+        const started = await api.beginPdfDrawingScan({ projectId, fileName: normalized.file.name, dataBase64: encoded.dataBase64, pageCount: pdf.numPages });
+        if (!started.ok || !started.id) throw new Error(started.message);
+        scanId = started.id;
+        const pagesPerBatch = 4;
+        for (let firstPage = 1; firstPage <= pdf.numPages; firstPage += pagesPerBatch) {
+          const lastPage = Math.min(pdf.numPages, firstPage + pagesPerBatch - 1);
+          setScanProgress(`Rendering pages ${firstPage}–${lastPage} of ${pdf.numPages} on this device…`);
+          const images = await renderPdfBatch(pdf, firstPage, lastPage);
+          setScanProgress(`Analyzing pages ${firstPage}–${lastPage} of ${pdf.numPages}…`);
+          const analyzed = await api.analyzePdfDrawingPages({ id: scanId, projectId, pageLabel: `Pages ${firstPage}-${lastPage} of ${pdf.numPages}`, images });
+          if (!analyzed.ok) throw new Error(analyzed.message);
+        }
+        setScanProgress("Assembling the proposal draft…");
+        const finished = await api.finalizePdfDrawingScan({ id: scanId, projectId, pageCount: pdf.numPages });
+        if (!finished.ok) throw new Error(finished.message);
+        return finished;
+      } catch (reason) {
+        if (scanId) await api.deleteDrawingProposal({ id: scanId, projectId }).catch(() => undefined);
+        throw reason;
+      } finally {
+        await pdf.destroy();
+      }
+    },
+    onSuccess: async (result) => {
+      setScanProgress("");
+      if (!result.ok) { setError(result.message); return; }
+      setPendingFile(null);
+      setMessage(result.message);
+      await qc.invalidateQueries({ queryKey: ["drawing-proposals", projectId] });
+      if (result.id) setSelectedId(result.id);
+    },
+    onError: (reason) => { setScanProgress(""); setError(reason instanceof Error ? reason.message : "The drawing could not be scanned."); },
+  });
+  const records = proposals.data?.proposals ?? [];
+  const selected = records.find((record) => record.id === selectedId) ?? records[0];
+  return <div className="drawing-center">
+    <section className="drawing-intake"><div><p>Drawing intake</p><h3>From plans to a review-ready proposal</h3><span>Choose a PDF or image up to 100 MB. Before scanning starts, confirm the exact file name and size. PDFs are rendered securely on your device and analyzed in four-page batches, up to 100 pages.</span></div><button type="button" className="primary" disabled={scan.isPending} onClick={() => input.current?.click()}>{scan.isPending ? "Scanning every page…" : pendingFile ? "Choose a different file" : "Choose drawing file"}</button><input ref={input} className="file-input-hidden" type="file" accept="application/pdf,image/*" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; setMessage(""); setError(""); if (!file) return; if (file.size > MAX_DRAWING_FILE_BYTES) { setPendingFile(null); setError("Choose a drawing no larger than 100 MB."); return; } if (file.type !== "application/pdf" && !file.type.startsWith("image/")) { setPendingFile(null); setError("Choose a PDF or image file."); return; } setPendingFile(file); }} />{pendingFile && <div className="drawing-file-confirm" role="region" aria-label="Confirm selected drawing"><div><span>File selected for scanning</span><strong>{pendingFile.name}</strong><small>{formatFileSize(pendingFile.size)} · {pendingFile.type === "application/pdf" ? "PDF" : "Image"}</small></div><p>Confirm this is the actual drawing set, not a screenshot or a saved copy of this platform.</p><div><button type="button" className="primary" disabled={scan.isPending} onClick={() => { setMessage(""); setError(""); scan.mutate(pendingFile); }}>{scan.isPending ? "Scanning selected file…" : "Scan this exact file"}</button><button type="button" className="secondary" disabled={scan.isPending} onClick={() => setPendingFile(null)}>Cancel selection</button></div></div>}<div className="intake-steps"><span><b>01</b> Confirm exact file</span><span><b>02</b> Render on device</span><span><b>03</b> Review and price</span><span><b>04</b> Approve proposal</span></div></section>
+    {scanProgress && <div className="scan-progress" role="status" aria-live="polite"><span className="scan-progress-dot" /> <strong>{scanProgress}</strong><small>Keep this artifact open until the proposal draft appears.</small></div>}
+    {(message || error) && <p className={error ? "error drawing-message" : "success drawing-message"} aria-live="polite">{error || message}</p>}
+    {proposals.isPending ? <p className="loading-inline">Loading drawing records…</p> : proposals.isError ? <div className="honest-empty"><h3>Drawing records could not be loaded</h3><p>Try reopening this worksheet.</p></div> : !records.length ? <div className="honest-empty"><h3>No drawings scanned yet</h3><p>Upload a drawing to start the estimator-gated pipeline. Nothing is imported into the proposal without your review.</p></div> : <><nav className="drawing-tabs" aria-label="Scanned drawings">{records.map((record) => <button type="button" className={selected?.id === record.id ? "active" : ""} key={record.id} onClick={() => setSelectedId(record.id)}><strong>{record.fileName}</strong><span>{record.status} · {new Date(record.updatedAt).toLocaleDateString()}</span></button>)}</nav>{selected && <ProposalEditor key={`${selected.id}-${selected.status === "processing" ? "processing" : "ready"}`} record={selected} projectId={projectId} />}</>}
+  </div>;
 }
 
 function AutomationCenter({ projectId, rows, onNavigate }: { projectId: number; rows: DataRow[]; onNavigate: (phase: Phase, moduleKey: string) => void }) {
@@ -529,7 +770,7 @@ export function App() {
             <label className="mobile-step">Current worksheet<select aria-label="Current worksheet" value={activeModule?.key} onChange={(e) => setModuleKey(e.target.value)}>{modules.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>
             {projectData.isPending ? <p className="loading-inline">Loading project data…</p> : projectData.isError ? <div className="honest-empty"><h3>Project data could not be loaded</h3><p>Switch projects or reopen the artifact and try again.</p></div> : activeModule && <>
               <div className="module-heading"><p>{phaseNames[phase]}</p><h2>{activeModule.label}</h2><span>{activeModule.intro}</span></div>
-              {activeModule.key === "dashboard" ? <Dashboard rows={data?.rows ?? []} /> : activeModule.key === "automation" ? <AutomationCenter key={selected?.id ?? 0} projectId={selected?.id ?? 0} rows={data?.rows ?? []} onNavigate={(nextPhase, nextModule) => { setTopLevel(nextPhase); setModuleKey(nextModule); }} /> : <>
+              {activeModule.key === "dashboard" ? <Dashboard rows={data?.rows ?? []} /> : activeModule.key === "automation" ? <AutomationCenter key={selected?.id ?? 0} projectId={selected?.id ?? 0} rows={data?.rows ?? []} onNavigate={(nextPhase, nextModule) => { setTopLevel(nextPhase); setModuleKey(nextModule); }} /> : activeModule.key === "drawing-proposal" ? <DrawingProposalCenter key={selected?.id ?? 0} projectId={selected?.id ?? 0} /> : <>
                 <SectionForm key={`${selected?.id ?? 0}-${activeModule.key}`} projectId={selected?.id ?? 0} module={activeModule} dataJson={section?.dataJson} updatedAt={section?.updatedAt} />
                 {activeModule.key === "raci" && !raciRoles.length && <p className="callout">Save at least one role above before adding matrix activities.</p>}
                 <div className="rows">{rows.map((r) => <RowEditor key={r.id} row={r} projectId={selected?.id ?? 0} module={activeModule} raciRoles={raciRoles} allRows={data?.rows ?? []} />)}</div>
