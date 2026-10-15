@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-cvm/
+.space-build/
+.space-build-cvm/
+.bun-cache/
+.harness/
+audits/
+blobs/
+*.db
+*.db-shm
+*.db-wal
+.env*
+*.local
