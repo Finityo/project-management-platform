@@ -13,6 +13,7 @@
     "@hatch/space-sdk": "file:/opt/hatch/skills/spaces/ts-runtime/dist/space-sdk.tgz",
     "@tanstack/react-query": "5.100.10",
     "drizzle-orm": "0.45.2",
+    "pdfjs-dist": "5.4.624",
     "react": "19.2.5",
     "react-dom": "19.2.5",
     "recharts": "2.15.3",
