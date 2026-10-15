@@ -95,7 +95,7 @@ const sheets: SheetSpec[] = [
   ] },
   { name: "PERT", moduleKey: "pert", rowFields: [
     { key: "activityId", label: "Activity ID" }, { key: "activityName", label: "Activity Name" }, { key: "predecessors", label: "Predecessor(s)" },
-    { key: "optimistic", label: "Optimistic (O)" }, { key: "mostLikely", label: "Most Likely (M)" }, { key: "pessimistic", label: "Pessimistic (P)" },
+    { key: "optimistic", label: "Optimistic (O)" }, { key: "most_likely", label: "Most Likely (M)" }, { key: "pessimistic", label: "Pessimistic (P)" },
     { key: "owner", label: "Owner" }, { key: "notes", label: "Notes" },
   ] },
   { name: "Project Timeline", moduleKey: "timeline", rowFields: [
@@ -127,6 +127,7 @@ function parseRecord(value: string | undefined): Record<string, string> {
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     const output: Record<string, string> = {};
     for (const [key, cell] of Object.entries(parsed)) output[key] = cell === null || cell === undefined ? "" : String(cell);
+    if (!("most_likely" in output) && "mostLikely" in output) output.most_likely = output.mostLikely ?? "";
     return output;
   } catch {
     return {};
